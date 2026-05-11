@@ -2,12 +2,13 @@ import streamlit as st
 import google.generativeai as genai
 import streamlit.components.v1 as components
 import re
+import html
 
 # =========================
 # Page settings
 # =========================
 st.set_page_config(
-    page_title="ベテランの経験や勘を見える化するアプリ",
+    page_title="顧客要求から判断を見える化するアプリ",
     layout="wide"
 )
 
@@ -24,14 +25,16 @@ st.markdown(
     padding-top: 50px;
     padding-bottom: 20px;
 }
-.block-title {
-    font-size: 18px;
-    font-weight: bold;
-    margin-top: 10px;
-}
 .small-note {
     font-size: 13px;
     color: #666;
+}
+.card {
+    padding: 16px;
+    border-radius: 12px;
+    border: 1px solid #E3E8EF;
+    background: #FAFBFC;
+    margin-bottom: 12px;
 }
 </style>
 """,
@@ -41,51 +44,106 @@ st.markdown(
 # =========================
 # Session state
 # =========================
-if "step" not in st.session_state:
-    st.session_state.step = 1
+defaults = {
+    "step": 1,
+    "messages": [],
+    "data": {},
+    "current_map": "",
+    "current_knowledge": "",
+    "final_document": "",
+}
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
-
-if "data" not in st.session_state:
-    st.session_state.data = {}
-
-if "current_map" not in st.session_state:
-    st.session_state.current_map = ""
-
-if "current_knowledge" not in st.session_state:
-    st.session_state.current_knowledge = ""
-
-if "final_document" not in st.session_state:
-    st.session_state.final_document = ""
+for key, value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
 # =========================
-# Mermaid renderer
+# Mermaid utilities
 # =========================
-def render_mermaid(mermaid_code: str) -> None:
-    code_text = mermaid_code or ""
+def extract_mermaid_code(raw_text: str) -> str:
+    """Extract Mermaid code from markdown block or raw Mermaid-like text."""
+    code_text = raw_text or ""
 
     match = re.search(r"```mermaid(.*?)```", code_text, re.DOTALL)
     if match:
         code_text = match.group(1).strip()
+    else:
+        code_text = code_text.replace("```", "").strip()
 
-    code_text = code_text.replace("```", "").strip()
+    # Remove accidental section markers or markdown headings that break Mermaid.
+    cleanup_lines = []
+    for line in code_text.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("==="):
+            continue
+        if stripped.startswith("#"):
+            continue
+        if stripped.startswith("- "):
+            continue
+        cleanup_lines.append(stripped)
+
+    code_text = "\n".join(cleanup_lines).strip()
+
+    # Ensure Mermaid graph header exists.
+    if code_text and not re.match(r"^(graph|flowchart)\s+", code_text):
+        code_text = "flowchart TD\n" + code_text
+
+    # Prefer flowchart TD for Mermaid 10.
+    code_text = re.sub(r"^graph\s+TD", "flowchart TD", code_text, flags=re.MULTILINE)
+
+    return code_text
+
+
+def default_mermaid() -> str:
+    return """flowchart TD
+A["顧客要求"] --> B{"最初に確認すること"}
+B --> C{"制約・リスク"}
+C --> D{"トレードオフ"}
+D --> E["判断・対応方針"]
+"""
+
+
+def render_mermaid(mermaid_code: str) -> None:
+    code_text = extract_mermaid_code(mermaid_code)
 
     if not code_text:
-        st.caption("判断マップはまだ生成されていません。")
-        return
+        code_text = default_mermaid()
+
+    # Escape for JS template literal safety.
+    safe_code = code_text.replace("\\", "\\\\").replace("`", "\\`").replace("${", "\\${")
+    visible_code = html.escape(code_text)
 
     html_code = f"""
-    <div class="mermaid" style="display:flex; justify-content:center; font-family:sans-serif;">
-        {code_text}
+    <div id="mermaid-container" style="width:100%; overflow:auto; padding:8px;">
+      <pre class="mermaid">{safe_code}</pre>
     </div>
+
+    <details style="margin-top:10px;">
+      <summary style="cursor:pointer; color:#666;">Mermaidコードを表示</summary>
+      <pre style="white-space:pre-wrap; font-size:12px; background:#f7f7f7; padding:8px; border-radius:8px;">{visible_code}</pre>
+    </details>
+
     <script type="module">
-        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
-        mermaid.initialize({{ startOnLoad: true, theme: 'default' }});
+      import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+      mermaid.initialize({{
+        startOnLoad: false,
+        theme: 'default',
+        securityLevel: 'loose'
+      }});
+
+      const el = document.querySelector('#mermaid-container .mermaid');
+      try {{
+        await mermaid.run({{ nodes: [el] }});
+      }} catch (e) {{
+        el.innerHTML = '<div style="color:#b00020; padding:12px; border:1px solid #f0b8b8; border-radius:8px; background:#fff5f5;">図の描画に失敗しました。抽出ナレッジは右タブで確認できます。<br><small>' + e.message + '</small></div>';
+      }}
     </script>
     """
-    components.html(html_code, height=620, scrolling=True)
+
+    components.html(html_code, height=680, scrolling=True)
 
 
 # =========================
@@ -93,9 +151,8 @@ def render_mermaid(mermaid_code: str) -> None:
 # =========================
 st.sidebar.title("設定")
 api_key = st.sidebar.text_input("Gemini APIキーを入力", type="password")
-
 st.sidebar.markdown("---")
-st.sidebar.caption("本アプリは第1段階：暗黙知の可視化・判断軸抽出用です。")
+st.sidebar.caption("第1段階：顧客要求を起点に、ベテランの判断構造を可視化するアプリです。")
 
 
 def get_ai_response(prompt: str, system_prompt: str = "") -> str | None:
@@ -162,6 +219,11 @@ def parse_ai_response(response_text: str) -> tuple[str, str, str]:
         else:
             chat_text = chat_part.strip()
 
+    # Harden map text against partial/invalid output.
+    map_text = extract_mermaid_code(map_text)
+    if not map_text:
+        map_text = default_mermaid()
+
     return chat_text.strip(), map_text.strip(), knowledge_text.strip()
 
 
@@ -171,15 +233,20 @@ def parse_ai_response(response_text: str) -> tuple[str, str, str]:
 def build_system_prompt() -> str:
     company_info = st.session_state.data.get("company_info", "")
     industry = st.session_state.data.get("industry", "")
-    task_category = st.session_state.data.get("task_category", "")
-    task_name = st.session_state.data.get("task_name", "")
+    customer_request = st.session_state.data.get("customer_request", "")
+    request_detail = st.session_state.data.get("request_detail", "")
+    focus_area = st.session_state.data.get("focus_area", "")
 
     return f"""
-あなたは、少人数製造業の暗黙知を可視化し、ベテラン社員の判断軸を抽出する専門コンサルタントです。
+あなたは、少人数製造業の「顧客要求に対する意思決定構造」を可視化する専門コンサルタントです。
 
-目的は、単なる業務手順を聞き出すことではありません。
-ベテラン社員が「どの条件で」「なぜその判断をするのか」を引き出し、
-若手社員や現場担当者が再現できる判断ナレッジに変換することです。
+目的は、単なる業務手順やマニュアルを作ることではありません。
+顧客要求を受けた時に、ベテラン社員や経営者が
+「何を危険と見て」
+「どの制約を確認し」
+「何と何をトレードオフとして考え」
+「最終的にどのように判断するのか」
+を引き出し、若手社員や現場担当者が再現できる判断ナレッジに変換することです。
 
 対象企業情報:
 {company_info}
@@ -187,31 +254,52 @@ def build_system_prompt() -> str:
 業種:
 {industry}
 
-対象業務カテゴリ:
-{task_category}
+顧客要求テーマ:
+{customer_request}
 
-対象業務:
-{task_name}
+顧客要求の具体例:
+{request_detail}
+
+重点的に見たい領域:
+{focus_area}
 
 特に重視する観点:
-1. 最初に確認する情報
-2. 判断が分かれる条件
-3. 危険なパターン
-4. 過去類似案件を見る基準
-5. 若手が間違えやすいポイント
-6. 社長・工場長・責任者に確認すべきライン
-7. 判断理由
-8. 例外対応
-9. 失敗事例
-10. 次に蓄積すべき情報
+1. 顧客要求の内容
+2. 顧客が本当に求めている価値
+3. 最初に確認すべき情報
+4. 発生しやすい問題
+5. 制約条件
+6. トレードオフ
+7. 見積への影響
+8. 工程設計への影響
+9. 協力工場選定への影響
+10. 品質判断への影響
+11. 優先順位
+12. 危険シグナル
+13. 上長確認が必要なライン
+14. ベテラン特有の着眼点
+15. 例外対応
+16. 若手が間違えやすいポイント
+17. 次に蓄積すべきデータ
 
 質問ルール:
 - 1回につき質問は1つだけ
+- 「顧客要求」を起点に質問する
 - 相手が答えやすいように、製造業の具体例を交える
 - 抽象的に聞きすぎない
 - 「なぜそう判断するのか」を必ず深掘りする
-- 手順だけでなく、判断軸・分岐条件・リスクを抽出する
+- 見積、工程設計、協力工場選定、品質判断のどこに影響するかを意識する
 - まだ情報が足りない場合は、無理に結論を出さず「未確認事項」として残す
+- AIが最終判断するのではなく、人が判断するための材料を整理する前提で進める
+
+Mermaid作成ルール:
+- 必ず flowchart TD で始める
+- ノードの文字は必ず ["..."] または {{"..."}} で囲む
+- ノードIDは A, B, C1, C2 のように半角英数字だけにする
+- 丸括弧 () は使わない
+- コロン :、セミコロン ;、スラッシュ /、バックスラッシュ、引用符はノード文言に使わない
+- 矢印ラベルは |はい| |いいえ| |高い| |低い| のように短くする
+- Mermaidブロック内には説明文や箇条書きを入れない
 
 出力は必ず以下の形式にしてください。
 
@@ -220,32 +308,57 @@ def build_system_prompt() -> str:
 
 ===MAP===
 ```mermaid
-graph TD
-A[対象業務] --> B{{判断条件}}
-B -->|条件A| C[対応A]
-B -->|条件B| D[対応B]
+flowchart TD
+A["顧客要求"] --> B{{"最初の確認"}}
+B --> C{{"制約とリスク"}}
+C --> D{{"トレードオフ"}}
+D --> E["判断と対応方針"]
 ```
 
 ===KNOWLEDGE===
-## 判断軸
+## 顧客要求
 - 
 
-## 確認事項
+## 顧客が本当に求めている価値
 - 
 
-## 分岐条件
+## 発生しやすい問題
 - 
 
-## 推奨対応
+## 制約条件
 - 
 
-## 注意点・リスク
+## トレードオフ
 - 
 
-## 若手が間違えやすいポイント
+## 見積への影響
+- 
+
+## 工程設計への影響
+- 
+
+## 協力工場選定への影響
+- 
+
+## 品質判断への影響
+- 
+
+## 判断ポイント
+- 
+
+## 危険シグナル
+- 
+
+## 優先順位
 - 
 
 ## 上長確認が必要なライン
+- 
+
+## ベテラン特有の着眼点
+- 
+
+## 若手が間違えやすいポイント
 - 
 
 ## 未確認事項
@@ -254,18 +367,26 @@ B -->|条件B| D[対応B]
 
 
 def build_final_prompt() -> str:
-    task_name = st.session_state.data.get("task_name", "判断テーマ")
+    customer_request = st.session_state.data.get("customer_request", "顧客要求")
+    request_detail = st.session_state.data.get("request_detail", "")
+    focus_area = st.session_state.data.get("focus_area", "")
     history = st.session_state.messages
     current_map = st.session_state.current_map
     current_knowledge = st.session_state.current_knowledge
 
     return f"""
-以下は、暗黙知抽出ヒアリングの会話履歴と、途中で抽出された判断マップ・判断ナレッジです。
+以下は、顧客要求起点の暗黙知抽出ヒアリングの会話履歴と、途中で抽出された判断マップ・判断ナレッジです。
 これらをもとに、NotebookLMや社内チャットボットに読み込ませやすい
-「AIナレッジ用マスタードキュメント」を作成してください。
+「顧客要求別・判断ナレッジ用マスタードキュメント」を作成してください。
 
-対象業務:
-{task_name}
+顧客要求テーマ:
+{customer_request}
+
+顧客要求の具体例:
+{request_detail}
+
+重点的に見たい領域:
+{focus_area}
 
 会話履歴:
 {history}
@@ -278,31 +399,45 @@ def build_final_prompt() -> str:
 
 出力形式:
 
-# {task_name} 判断ナレッジ・マスタードキュメント
+# {customer_request} 顧客要求別・判断ナレッジ マスタードキュメント
 
-## 1. 対象業務の概要
+## 1. 顧客要求の概要
 
-## 2. 業務の目的
+## 2. 顧客が本当に求めている価値
 
 ## 3. 最初に確認すべき情報
 
-## 4. 判断軸一覧
+## 4. 発生しやすい問題パターン
 
-## 5. 判断分岐フロー
+## 5. 制約条件
 
-## 6. ケース別の推奨対応
+## 6. トレードオフ
 
-## 7. 注意点・リスク
+## 7. 見積への影響
 
-## 8. 若手が間違えやすいポイント
+## 8. 工程設計への影響
 
-## 9. 上長確認が必要なライン
+## 9. 協力工場選定への影響
 
-## 10. 未確認事項・今後ヒアリングすべきこと
+## 10. 品質判断への影響
 
-## 11. AIチャットボット化する際に必要なデータ
+## 11. 判断ポイント一覧
 
-## 12. 新人向けの簡易マニュアル
+## 12. 危険シグナル
+
+## 13. ケース別の推奨対応
+
+## 14. 上長確認が必要なライン
+
+## 15. ベテラン特有の着眼点
+
+## 16. 若手が間違えやすいポイント
+
+## 17. 未確認事項・今後ヒアリングすべきこと
+
+## 18. AIチャットボット化する際に必要なデータ
+
+## 19. 新人向けの簡易マニュアル
 """
 
 
@@ -314,12 +449,13 @@ col_logo, col_title = st.columns([1, 8])
 with col_logo:
     st.image(
         "https://organa.jp/images/logomark.svg",
-        width=80  # ←サイズ調整ここ
+        width=80,
     )
 
 with col_title:
-    st.title("ベテランの経験や勘を見える化")
-    st.caption("ベテランの判断を、若手が使える知識に変える暗黙知可視化アプリ")
+    st.title("顧客要求から判断を見える化")
+    st.caption("顧客の要望に対して、見積・工程・協力工場・品質の判断構造を整理するアプリ")
+
 st.markdown("---")
 
 
@@ -377,40 +513,62 @@ elif st.session_state.step == 2:
 
 
 elif st.session_state.step == 3:
-    st.subheader("Step 3：今回抽出したい判断テーマを選んでください")
+    st.subheader("Step 3：今回整理したい顧客要求を選んでください")
 
-    task_category = st.radio(
-        "判断テーマ",
+    customer_request = st.radio(
+        "顧客要求テーマ",
         [
-            "新規見積",
-            "図面なし案件対応",
-            "工程設計",
-            "協力工場選定",
-            "品質判断",
-            "納期調整",
+            "短納期要求",
+            "高精度要求",
+            "低コスト要求",
+            "図面なし案件",
+            "試作対応",
+            "品質優先",
+            "大量ロット",
+            "仕様変更",
             "クレーム・不具合対応",
             "その他",
         ],
     )
 
-    task_name = st.text_input(
-        "具体的な業務名",
-        placeholder="例：図面なしの新規見積判断、協力工場の選定判断、NC旋盤の工程設計判断",
+    request_detail = st.text_area(
+        "顧客要求の具体例",
+        height=100,
+        placeholder=(
+            "例：お客様から『通常より早く納品してほしい』と言われた。"
+            "その場合、見積・工程設計・協力工場選定・品質判断にどのような影響が出るかを整理したい。"
+        ),
+    )
+
+    focus_area = st.multiselect(
+        "重点的に見たい領域",
+        [
+            "見積",
+            "工程設計",
+            "協力工場選定",
+            "品質判断",
+            "納期調整",
+            "顧客対応",
+            "社内優先順位",
+        ],
+        default=["見積", "工程設計", "協力工場選定", "品質判断"],
     )
 
     st.info(
-        "おすすめデモテーマ：『図面なしの新規見積判断』。"
-        "判断軸・リスク・確認事項が出やすく、製造業の暗黙知を可視化しやすいテーマです。"
+        "おすすめデモテーマ：『短納期要求』。"
+        "見積・工程設計・協力工場選定・品質判断に横断的な影響が出やすく、"
+        "顧客要求起点の意思決定構造を見せやすいテーマです。"
     )
 
     if st.button("ヒアリングを開始する", type="primary"):
-        if task_name:
-            st.session_state.data["task_category"] = task_category
-            st.session_state.data["task_name"] = task_name
+        if request_detail:
+            st.session_state.data["customer_request"] = customer_request
+            st.session_state.data["request_detail"] = request_detail
+            st.session_state.data["focus_area"] = "、".join(focus_area)
             st.session_state.step = 4
             st.rerun()
         else:
-            st.warning("具体的な業務名を入力してください。")
+            st.warning("顧客要求の具体例を入力してください。")
 
 
 # =========================
@@ -430,7 +588,7 @@ elif st.session_state.step == 4:
             if not st.session_state.messages:
                 with st.spinner("AIが最初の質問を準備しています..."):
                     initial_response = get_ai_response(
-                        "対象業務について、最初の質問をしてください。初期の判断マップと判断ナレッジも出力してください。",
+                        "顧客要求を起点に、最初の深掘り質問をしてください。初期の判断マップと判断ナレッジも出力してください。",
                         system_prompt,
                     )
 
@@ -459,7 +617,7 @@ elif st.session_state.step == 4:
             history_text = str(st.session_state.messages[-8:])
 
             prompt = f"""
-以下の会話履歴を踏まえて、次の深掘り質問を1つ行ってください。
+以下の会話履歴を踏まえて、顧客要求に対する意思決定構造をさらに深掘りする質問を1つ行ってください。
 同時に、判断マップと判断ナレッジを更新してください。
 
 会話履歴:
@@ -497,7 +655,7 @@ elif st.session_state.step == 4:
             with st.spinner("AIナレッジ用マスタードキュメントを生成しています..."):
                 final_response = get_ai_response(
                     build_final_prompt(),
-                    "あなたは製造業の暗黙知を、AIナレッジベース用ドキュメントへ整理する専門家です。",
+                    "あなたは製造業の顧客要求起点の暗黙知を、AIナレッジベース用ドキュメントへ整理する専門家です。",
                 )
 
                 if final_response:
@@ -516,14 +674,14 @@ elif st.session_state.step == 4:
             if st.session_state.current_knowledge:
                 st.markdown(st.session_state.current_knowledge)
             else:
-                st.caption("ヒアリングを進めると、判断軸・注意点・未確認事項がここに整理されます。")
+                st.caption("ヒアリングを進めると、顧客要求・問題・制約・トレードオフ・判断ポイントがここに整理されます。")
 
 
 # =========================
 # Step 5: Final output
 # =========================
 elif st.session_state.step == 5:
-    st.subheader("判断ナレッジ・マスタードキュメント生成完了")
+    st.subheader("顧客要求別・判断ナレッジ生成完了")
 
     st.success(
         "ヒアリング内容から、判断支援AIやNotebookLMに読み込ませやすいマスタードキュメントを生成しました。"
@@ -533,10 +691,10 @@ elif st.session_state.step == 5:
 
     with col1:
         st.markdown("### 生成された成果物")
-        st.write("1. 判断フローチャート")
-        st.write("2. 判断軸一覧")
-        st.write("3. ケース別対応")
-        st.write("4. 注意点・リスク")
+        st.write("1. 顧客要求別の判断フローチャート")
+        st.write("2. 発生しやすい問題パターン")
+        st.write("3. 制約条件・トレードオフ")
+        st.write("4. 見積・工程・工場選定・品質への影響")
         st.write("5. AIナレッジ用ドキュメント")
 
         st.markdown("---")
@@ -544,12 +702,12 @@ elif st.session_state.step == 5:
         st.download_button(
             label="マスタードキュメントをダウンロード",
             data=st.session_state.final_document,
-            file_name=f"{st.session_state.data.get('task_name', '判断ナレッジ')}_master_document.md",
+            file_name=f"{st.session_state.data.get('customer_request', '顧客要求')}_master_document.md",
             mime="text/markdown",
             use_container_width=True,
         )
 
-        if st.button("新しい判断テーマを登録する", use_container_width=True):
+        if st.button("新しい顧客要求を登録する", use_container_width=True):
             st.session_state.clear()
             st.rerun()
 
